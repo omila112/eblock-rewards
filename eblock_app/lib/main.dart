@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:typed_data';
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
@@ -11,6 +12,11 @@ import 'firebase_options.dart';
 
 import 'package:tflite_flutter/tflite_flutter.dart'
     if (dart.library.html) 'dart:async' as tflite;
+
+// ⚙️ CONFIGURATION
+const String API_ENDPOINT = 'http://10.0.2.2:3000'; // FOR ANDROID EMULATOR
+// For physical device, replace with: 'http://192.168.1.143:3000'
+const String USER_WALLET_ADDRESS = '0xACe1E87d15d57Be4bd6A06316578b1d878f81071';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -73,7 +79,7 @@ class _MainNavigationState extends State<MainNavigation> {
   }
 
   void _refreshBalance() {
-    _homePageKey.currentState?._loadBalance();
+    _homePageKey.currentState?._loadBalanceWithRetry();
   }
 
   @override
@@ -262,7 +268,7 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   String _balance = "Loading...";
   bool _isLoading = false;
-  final String myAddress = "0x8A84C0063B1F8182841448A1AAdb92D866146445";
+  final String myAddress = USER_WALLET_ADDRESS;
 
   @override
   void initState() {
@@ -277,32 +283,116 @@ class _HomePageState extends State<HomePage> {
     if (mounted) setState(() => _isLoading = false);
   }
 
+  Future<void> _loadBalanceWithRetry() async {
+    if (!mounted) return;
+    final previousBalance = _balance;
+
+    // Try up to 3 times with 1-second delays to account for blockchain settlement
+    for (int attempt = 1; attempt <= 3; attempt++) {
+      await _loadBalance();
+
+      debugPrint(
+          "💰 [BALANCE] Attempt $attempt: Previous=$previousBalance, Current=$_balance");
+
+      // If balance changed, we're done
+      if (_balance != previousBalance &&
+          _balance != "Offline" &&
+          _balance != "Error") {
+        debugPrint(
+            "✅ [BALANCE] Balance updated on attempt $attempt: $_balance EBR");
+        return;
+      }
+
+      // If this is not the last attempt, wait before retrying
+      if (attempt < 3) {
+        debugPrint(
+            "⏳ [BALANCE] Balance not updated yet. Retrying in 1s... (attempt ${attempt + 1})");
+        await Future.delayed(const Duration(seconds: 1));
+      }
+    }
+
+    debugPrint(
+        "⚠️ [BALANCE] Balance did not update after 3 attempts. Current: $_balance");
+  }
+
   Future<void> _getBal() async {
     try {
       final res = await http
-          .get(Uri.parse('http://10.0.2.2:3000/api/balance/$myAddress'))
+          .get(Uri.parse('$API_ENDPOINT/api/balance/$myAddress'))
           .timeout(const Duration(seconds: 5));
 
       if (res.statusCode == 200) {
         if (mounted) {
+          final newBalance = jsonDecode(res.body)['balance'].toString();
+          debugPrint(
+              "📊 [BALANCE] Server returned: $newBalance EBR for address $myAddress");
           setState(() {
-            _balance = jsonDecode(res.body)['balance'].toString();
+            _balance = newBalance;
           });
         }
       } else {
         if (mounted) {
           setState(() => _balance = "Error");
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text("Failed to fetch balance")),
+            const SnackBar(
+              content: Text("❌ Server Error: Failed to fetch balance"),
+              backgroundColor: Colors.red,
+              duration: Duration(seconds: 3),
+            ),
           );
         }
+      }
+    } on SocketException catch (e) {
+      debugPrint("Connection error: $e");
+      if (mounted) {
+        setState(() => _balance = "Offline");
+        _showServerOfflineDialog("Unable to fetch balance",
+            "The server is offline or unreachable. Please check your connection and try again.");
       }
     } catch (e) {
       debugPrint("Balance fetch error: $e");
       if (mounted) {
         setState(() => _balance = "Offline");
+        _showServerOfflineDialog("Connection Error",
+            "Failed to connect to server.\n\nError: ${e.toString()}");
       }
     }
+  }
+
+  void _showServerOfflineDialog(String title, String message) {
+    if (!mounted) return;
+
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: Row(
+            children: [
+              const Icon(Icons.cloud_off, color: Colors.red, size: 28),
+              const SizedBox(width: 12),
+              Text(title),
+            ],
+          ),
+          content: Text(
+            message,
+            style: const TextStyle(fontSize: 14),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text("OK"),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                _loadBalance();
+              },
+              child: const Text("Retry"),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   @override
@@ -446,7 +536,7 @@ class _HomePageState extends State<HomePage> {
             debugPrint("🚀 Simulating reward - sending to server...");
             final response = await http
                 .post(
-                  Uri.parse('http://10.0.2.2:3000/api/reward'),
+                  Uri.parse('$API_ENDPOINT/api/reward'),
                   headers: {'Content-Type': 'application/json'},
                   body: jsonEncode({
                     'user': myAddress,
@@ -464,17 +554,40 @@ class _HomePageState extends State<HomePage> {
                   const SnackBar(
                     content: Text("✅ +25 EBR received!"),
                     backgroundColor: Colors.green,
+                    duration: Duration(seconds: 3),
+                  ),
+                );
+              }
+            } else {
+              if (mounted) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  SnackBar(
+                    content: Text("❌ Server error: ${response.statusCode}"),
+                    backgroundColor: Colors.red,
+                    duration: const Duration(seconds: 3),
                   ),
                 );
               }
             }
             await Future.delayed(const Duration(milliseconds: 500));
             await _loadBalance();
+          } on SocketException catch (e) {
+            debugPrint("❌ Connection error: $e");
+            if (mounted) {
+              _showServerOfflineDialog(
+                "Connection Error",
+                "Unable to reach the server. Please check:\n\n"
+                    "• Server is running (node server.js)\n"
+                    "• Network connection is active\n"
+                    "• Correct API endpoint is configured",
+              );
+            }
           } catch (e) {
             debugPrint("❌ Simulation failed: $e");
             if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(content: Text("Error: $e")),
+              _showServerOfflineDialog(
+                "Error",
+                "Failed to submit reward.\n\n${e.toString()}",
               );
             }
           } finally {
@@ -533,6 +646,127 @@ class _ActionButton extends StatelessWidget {
   }
 }
 
+// --- WITHDRAWAL SERVICE (FACADE PATTERN) ---
+/**
+ * WithdrawalService encapsulates all withdrawal-related API calls
+ * Follows Facade Design Pattern to hide HTTP complexity from UI
+ */
+class WithdrawalService {
+  static const String apiBase = API_ENDPOINT;
+
+  /// Attempt to withdraw tokens from user's balance
+  /// Returns transaction hash on success
+  /// Throws exception with user-friendly message on failure
+  static Future<WithdrawalResult> withdraw({
+    required String userAddress,
+    required double amount,
+  }) async {
+    try {
+      // Validate inputs before making API call
+      if (!_isValidEthereumAddress(userAddress)) {
+        throw WithdrawalException('Invalid Ethereum address format');
+      }
+
+      if (amount <= 0) {
+        throw WithdrawalException('Amount must be greater than 0');
+      }
+
+      debugPrint('💰 Initiating withdrawal: $amount EBR from $userAddress');
+
+      final response = await http
+          .post(
+            Uri.parse('$apiBase/api/withdraw'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'userAddress': userAddress,
+              'amount': amount.toString(),
+            }),
+          )
+          .timeout(const Duration(seconds: 10));
+
+      debugPrint('📡 Withdrawal Response: ${response.statusCode}');
+      debugPrint('Response Body: ${response.body}');
+
+      final responseData = jsonDecode(response.body);
+
+      if (response.statusCode == 200 && responseData['success'] == true) {
+        return WithdrawalResult(
+          success: true,
+          transactionHash: responseData['transactionHash'],
+          message: responseData['message'] ?? 'Withdrawal successful',
+          amount: amount,
+        );
+      } else if (response.statusCode == 400) {
+        // Handle specific error types
+        if (responseData['error'] == 'Insufficient Funds') {
+          final details = responseData['details'];
+          throw WithdrawalException(
+            'Insufficient Funds\n\n'
+            'Your Balance: ${details['userBalance']} EBR\n'
+            'Requested: ${details['requestedAmount']} EBR',
+          );
+        }
+        throw WithdrawalException(
+          responseData['error'] ?? 'Withdrawal failed',
+        );
+      } else if (response.statusCode == 503) {
+        // Service unavailable - contract insufficient funds
+        final details = responseData['details'];
+        throw WithdrawalException(
+          'Server Insufficient Reserves\n\n'
+          'Please try again later\n'
+          'Available: ${details['contractBalance']} EBR',
+        );
+      } else {
+        throw WithdrawalException(
+          'Withdrawal failed (${response.statusCode})',
+        );
+      }
+    } on SocketException {
+      throw WithdrawalException(
+        'Connection Error\n\n'
+        'Unable to reach the server.\n'
+        'Please check your network connection.',
+      );
+    } catch (e) {
+      if (e is WithdrawalException) rethrow;
+      throw WithdrawalException(
+        'Unexpected Error\n\n${e.toString()}',
+      );
+    }
+  }
+
+  /// Validate Ethereum address format (0x followed by 40 hex characters)
+  static bool _isValidEthereumAddress(String address) {
+    final ethereumAddressRegex = RegExp(r'^0x[a-fA-F0-9]{40}$');
+    return ethereumAddressRegex.hasMatch(address);
+  }
+}
+
+/// Custom exception for withdrawal errors
+class WithdrawalException implements Exception {
+  final String message;
+  WithdrawalException(this.message);
+
+  @override
+  String toString() => message;
+}
+
+/// Result object for successful withdrawal
+class WithdrawalResult {
+  final bool success;
+  final String transactionHash;
+  final String message;
+  final double amount;
+
+  WithdrawalResult({
+    required this.success,
+    required this.transactionHash,
+    required this.message,
+    required this.amount,
+  });
+}
+
 // --- TRANSACTION PAGE ---
 enum TransactionType { deposit, withdraw }
 
@@ -548,11 +782,41 @@ class _TransactionPageState extends State<TransactionPage> {
   final _amountController = TextEditingController();
   final _walletController = TextEditingController();
   bool _isProcessing = false;
+  final String userAddress = USER_WALLET_ADDRESS;
+
+  @override
+  void initState() {
+    super.initState();
+    // Pre-fill wallet address for withdrawals
+    if (widget.type == TransactionType.withdraw) {
+      _walletController.text = userAddress;
+    }
+  }
+
+  @override
+  void dispose() {
+    _amountController.dispose();
+    _walletController.dispose();
+    super.dispose();
+  }
 
   Future<void> _processTransaction() async {
     if (_amountController.text.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("Please enter an amount")),
+        const SnackBar(
+          content: Text("❌ Please enter an amount"),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    if (_walletController.text.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("❌ Please enter a wallet address"),
+          backgroundColor: Colors.red,
+        ),
       );
       return;
     }
@@ -560,28 +824,158 @@ class _TransactionPageState extends State<TransactionPage> {
     setState(() => _isProcessing = true);
 
     try {
-      // Simulate API call
-      await Future.delayed(const Duration(seconds: 2));
+      final amount = double.parse(_amountController.text);
 
+      if (widget.type == TransactionType.withdraw) {
+        // Real withdrawal to blockchain
+        await _processBlockchainWithdrawal(amount);
+      } else {
+        // Simulated deposit
+        await _processSimulatedDeposit(amount);
+      }
+    } catch (e) {
+      debugPrint('Transaction error: $e');
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(
-              "${widget.type == TransactionType.deposit ? "Deposit" : "Withdrawal"} of ${_amountController.text} EBR successful!",
-            ),
-            backgroundColor: Colors.green,
+            content: Text("❌ Error: $e"),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 4),
           ),
-        );
-        Navigator.pop(context);
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text("Error: $e")),
         );
       }
     } finally {
       if (mounted) setState(() => _isProcessing = false);
+    }
+  }
+
+  /// Process real blockchain withdrawal
+  Future<void> _processBlockchainWithdrawal(double amount) async {
+    try {
+      final result = await WithdrawalService.withdraw(
+        userAddress: _walletController.text,
+        amount: amount,
+      );
+
+      if (mounted) {
+        // Show success dialog with transaction details
+        showDialog(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Row(
+              children: [
+                Icon(Icons.check_circle, color: Colors.green, size: 28),
+                SizedBox(width: 12),
+                Text("Withdrawal Successful"),
+              ],
+            ),
+            content: SingleChildScrollView(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    'Amount: ${result.amount} EBR',
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  const Text(
+                    'Transaction Hash:',
+                    style: TextStyle(fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 8),
+                  SelectableText(
+                    result.transactionHash,
+                    style: const TextStyle(
+                      fontFamily: 'monospace',
+                      fontSize: 12,
+                      color: Colors.grey,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.green[50],
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      '✅ ${result.message}',
+                      style: TextStyle(
+                        color: Colors.green[700],
+                        fontSize: 14,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () {
+                  Navigator.pop(context);
+                  Navigator.pop(context); // Close transaction page
+                },
+                child: const Text("Done"),
+              ),
+            ],
+          ),
+        );
+
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("✅ Withdrawal of ${result.amount} EBR successful!"),
+            backgroundColor: Colors.green,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+    } on WithdrawalException catch (e) {
+      if (mounted) {
+        showDialog(
+          context: context,
+          builder: (context) => AlertDialog(
+            title: const Row(
+              children: [
+                Icon(Icons.error, color: Colors.red, size: 28),
+                SizedBox(width: 12),
+                Text("Withdrawal Failed"),
+              ],
+            ),
+            content: Text(
+              e.message,
+              style: const TextStyle(fontSize: 14),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: const Text("OK"),
+              ),
+            ],
+          ),
+        );
+      }
+    }
+  }
+
+  /// Process simulated deposit (placeholder)
+  Future<void> _processSimulatedDeposit(double amount) async {
+    await Future.delayed(const Duration(seconds: 2));
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            "✅ Deposit of $amount EBR successful! (Simulated)",
+          ),
+          backgroundColor: Colors.green,
+          duration: const Duration(seconds: 3),
+        ),
+      );
+      Navigator.pop(context);
     }
   }
 
@@ -657,6 +1051,7 @@ class _TransactionPageState extends State<TransactionPage> {
             TextField(
               controller: _amountController,
               keyboardType: TextInputType.number,
+              enabled: !_isProcessing,
               decoration: InputDecoration(
                 hintText: "Enter amount",
                 prefixIcon: const Icon(Icons.local_offer),
@@ -673,12 +1068,13 @@ class _TransactionPageState extends State<TransactionPage> {
 
             // Wallet/Address Input
             Text(
-              isDeposit ? "From Address" : "To Address",
+              isDeposit ? "From Address" : "Your Address",
               style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
             ),
             const SizedBox(height: 8),
             TextField(
               controller: _walletController,
+              enabled: !_isProcessing,
               decoration: InputDecoration(
                 hintText: "Enter wallet address",
                 prefixIcon: const Icon(Icons.account_balance_wallet),
@@ -707,7 +1103,7 @@ class _TransactionPageState extends State<TransactionPage> {
                     child: Text(
                       isDeposit
                           ? "Processing typically takes 1-2 minutes"
-                          : "Withdrawal requests are processed within 24 hours",
+                          : "Withdrawal transactions are processed\nimmediately on the blockchain",
                       style: TextStyle(color: Colors.blue[700], fontSize: 13),
                     ),
                   ),
@@ -716,7 +1112,7 @@ class _TransactionPageState extends State<TransactionPage> {
             ),
             const SizedBox(height: 40),
 
-            // Submit Button
+            // Submit Button with Loading State
             SizedBox(
               width: double.infinity,
               height: 50,
@@ -724,19 +1120,30 @@ class _TransactionPageState extends State<TransactionPage> {
                 onPressed: _isProcessing ? null : _processTransaction,
                 style: ElevatedButton.styleFrom(
                   backgroundColor: color,
+                  disabledBackgroundColor: Colors.grey,
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(12),
                   ),
                 ),
                 child: _isProcessing
-                    ? const SizedBox(
-                        width: 20,
-                        height: 20,
-                        child: CircularProgressIndicator(
-                          strokeWidth: 2,
-                          valueColor:
-                              AlwaysStoppedAnimation<Color>(Colors.white),
-                        ),
+                    ? const Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          SizedBox(
+                            width: 20,
+                            height: 20,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              valueColor:
+                                  AlwaysStoppedAnimation<Color>(Colors.white),
+                            ),
+                          ),
+                          SizedBox(width: 12),
+                          Text(
+                            "Processing...",
+                            style: TextStyle(fontWeight: FontWeight.bold),
+                          ),
+                        ],
                       )
                     : Text(
                         buttonText,
@@ -751,13 +1158,6 @@ class _TransactionPageState extends State<TransactionPage> {
         ),
       ),
     );
-  }
-
-  @override
-  void dispose() {
-    _amountController.dispose();
-    _walletController.dispose();
-    super.dispose();
   }
 }
 
@@ -775,8 +1175,14 @@ class _ScannerPageState extends State<ScannerPage> {
   bool _isProcessing = false;
   String? _lastScannedQR;
   final MobileScannerController _controller = MobileScannerController();
-  final String myAddress = "0x8A84C0063B1F8182841448A1AAdb92D866146445";
-  int _rewardAmount = 0;
+  final String myAddress = USER_WALLET_ADDRESS;
+
+  // List to store scanned QR codes (prevent duplicate rewards)
+  final List<String> _scannedQRCodes = [];
+
+  // Scan cooldown to prevent rapid successive scans
+  DateTime? _lastScanTime;
+  final int _scanCooldownMs = 3000; // 3 seconds between scans
 
   @override
   void initState() {
@@ -804,62 +1210,177 @@ class _ScannerPageState extends State<ScannerPage> {
     }
   }
 
-  Future<void> _addReward(int amount) async {
+  Future<Map<String, dynamic>> _addReward() async {
     try {
+      debugPrint('💰 [REWARD] Sending reward to address: $myAddress');
+
       final response = await http
           .post(
-            Uri.parse('http://10.0.2.2:3000/api/reward'),
+            Uri.parse('$API_ENDPOINT/api/reward'),
             headers: {'Content-Type': 'application/json'},
             body: jsonEncode({
               'user': myAddress,
-              'weight': amount,
             }),
           )
           .timeout(const Duration(seconds: 5));
 
-      debugPrint("Reward response: ${response.statusCode}");
+      debugPrint("📡 [REWARD] Server response code: ${response.statusCode}");
+      debugPrint("📡 [REWARD] Server response body: ${response.body}");
+
       if (response.statusCode == 200) {
-        debugPrint("✅ Reward added: $amount EBR");
+        final responseData = jsonDecode(response.body);
+        final ewasteData = responseData['ewasteData'] ?? {};
+        final int rewardAmount = responseData['tokens'] ?? 0;
+        final String category = ewasteData['category'] ?? 'Unknown';
+        final String subType = ewasteData['subType'] ?? 'Unknown';
+        final double weight = (ewasteData['weight'] ?? 0.0).toDouble();
+
+        debugPrint(
+            "✅ [REWARD] Reward added: $weight kg of $category ($subType) = $rewardAmount EBR");
+        debugPrint("📊 [REWARD] Full ewasteData: $ewasteData");
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                  "✅ Reward: ${weight.toStringAsFixed(2)} kg $subType = +$rewardAmount EBR"),
+              backgroundColor: Colors.green,
+              duration: const Duration(seconds: 2),
+            ),
+          );
+        }
+        return ewasteData;
       } else {
-        debugPrint("❌ Failed to add reward: ${response.body}");
+        debugPrint("❌ [REWARD] Failed to add reward: ${response.body}");
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                  "⚠️ Server error: ${response.statusCode}\n${response.body}"),
+              backgroundColor: Colors.orange,
+              duration: const Duration(seconds: 3),
+            ),
+          );
+        }
+        return {};
       }
+    } on SocketException catch (e) {
+      debugPrint("❌ [REWARD] Connection error: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: const Text(
+              "🚫 Server Offline - Reward could not be submitted.\n"
+              "Please ensure the Node.js server is running.",
+            ),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 4),
+          ),
+        );
+      }
+      return {};
     } catch (e) {
-      debugPrint("Reward error: $e");
+      debugPrint("❌ [REWARD] Unexpected error: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("❌ Error: $e"),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 3),
+          ),
+        );
+      }
+      return {};
     }
   }
 
-  int _generateRandomReward() {
-    // Random reward between 5-50 EBR
-    return 5 + (DateTime.now().millisecond % 46);
-  }
-
-  void _onDetect(BarcodeCapture capture) {
+  Future<void> _onDetect(BarcodeCapture capture) async {
     if (kIsWeb || _isProcessing) return;
     if (capture.barcodes.isEmpty) return;
 
+    // Check scan cooldown to prevent rapid successive scans
+    final now = DateTime.now();
+    if (_lastScanTime != null) {
+      final timeSinceLast = now.difference(_lastScanTime!).inMilliseconds;
+      if (timeSinceLast < _scanCooldownMs) {
+        final remainingMs = _scanCooldownMs - timeSinceLast;
+        debugPrint(
+            "⏱️ [SCAN] Scan cooldown active. Wait ${(remainingMs / 1000).toStringAsFixed(1)}s");
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+                "⏱️ Please wait ${(remainingMs / 1000).toStringAsFixed(1)}s before scanning again"),
+            backgroundColor: Colors.orange,
+            duration: Duration(milliseconds: remainingMs.clamp(500, 2000)),
+          ),
+        );
+        return;
+      }
+    }
+    _lastScanTime = now;
+
     final String qrValue = capture.barcodes.first.rawValue ?? "Unknown";
 
-    if (_lastScannedQR == qrValue) return;
+    // Check if QR code has already been scanned (prevent duplicate rewards)
+    if (_scannedQRCodes.contains(qrValue)) {
+      debugPrint(
+          "⚠️ [SCAN] QR code already scanned! Cannot use duplicate: $qrValue");
+      setState(() => _isProcessing = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+              "❌ This QR code has already been scanned! Try a different bin."),
+          backgroundColor: Colors.red,
+          duration: Duration(seconds: 3),
+        ),
+      );
+      return;
+    }
+
+    // Add QR code to scanned list
+    _scannedQRCodes.add(qrValue);
+    debugPrint(
+        "✅ [SCAN] QR code added to scanned list. Total scans: ${_scannedQRCodes.length}");
+
+    if (_lastScannedQR == qrValue) {
+      debugPrint("⏭️ [SCAN] Same QR code scanned, skipping");
+      return;
+    }
     _lastScannedQR = qrValue;
 
     setState(() => _isProcessing = true);
-    debugPrint("📱 QR Detected: $qrValue");
+    debugPrint("📱 [SCAN] QR Detected: $qrValue");
+    debugPrint("📱 [SCAN] Reward recipient address: $myAddress");
 
     try {
       String result = "detected";
       if (_isModelLoaded && capture.image != null) {
         result = _predict(capture.image!);
+        debugPrint("🤖 [SCAN] Model prediction: $result");
+      } else {
+        debugPrint("⚠️ [SCAN] Model not loaded, skipping AI prediction");
       }
 
-      // Generate and add reward
-      int reward = _generateRandomReward();
-      setState(() => _rewardAmount = reward);
-      _addReward(reward);
-      widget.onRewardEarned?.call(); // Trigger balance refresh
+      // Call server to get e-waste data and send reward
+      final Map<String, dynamic> ewasteData = await _addReward();
 
-      _showResult(qrValue, result, reward);
+      if (ewasteData.isEmpty) {
+        debugPrint("❌ [SCAN] No e-waste data received from server");
+        setState(() => _isProcessing = false);
+        return;
+      }
+
+      final String category = ewasteData['category'] as String;
+      final String subType = ewasteData['subType'] as String;
+      final double weight = (ewasteData['weight'] ?? 0.0).toDouble();
+      final int reward = (ewasteData['rewardAmount'] ?? 0) as int;
+
+      debugPrint(
+          "🎯 [SCAN] Received: $weight kg of $category ($subType) = $reward EBR");
+
+      _showResult(qrValue, result, ewasteData);
+      debugPrint("✅ [SCAN] Result dialog shown");
     } catch (e) {
-      debugPrint("❌ Detection error: $e");
+      debugPrint("❌ [SCAN] Detection error: $e");
       setState(() {
         _isProcessing = false;
         _lastScannedQR = null;
@@ -900,7 +1421,12 @@ class _ScannerPageState extends State<ScannerPage> {
     }
   }
 
-  void _showResult(String id, String res, int reward) {
+  void _showResult(String id, String res, Map<String, dynamic> ewasteData) {
+    final String category = ewasteData['category'] ?? 'Unknown';
+    final String subType = ewasteData['subType'] ?? 'Unknown';
+    final double weight = (ewasteData['weight'] ?? 0.0).toDouble();
+    final int reward = (ewasteData['rewardAmount'] ?? 0) as int;
+
     String title;
     String subtitle;
     IconData icon;
@@ -926,98 +1452,146 @@ class _ScannerPageState extends State<ScannerPage> {
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
-      builder: (c) => Container(
-        padding: const EdgeInsets.all(20),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(icon, size: 60, color: Colors.green),
-            const SizedBox(height: 16),
-            Text(
-              title,
-              style: const TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 8),
-            Text(
-              subtitle,
-              style: TextStyle(fontSize: 14, color: Colors.grey[600]),
-              textAlign: TextAlign.center,
-            ),
-            const SizedBox(height: 20),
-            // Reward Card
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: Colors.amber[50],
-                border: Border.all(color: Colors.amber[700]!, width: 2),
-                borderRadius: BorderRadius.circular(12),
+      builder: (c) => SingleChildScrollView(
+        child: Container(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 60, color: Colors.green),
+              const SizedBox(height: 16),
+              Text(
+                title,
+                style:
+                    const TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
               ),
-              child: Column(
-                children: [
-                  const Text(
-                    "🎉 Reward Earned!",
-                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
-                  ),
-                  const SizedBox(height: 8),
-                  Text(
-                    "+$reward EBR",
-                    style: TextStyle(
-                      fontSize: 28,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.amber[900],
-                    ),
-                  ),
-                ],
+              const SizedBox(height: 8),
+              Text(
+                subtitle,
+                style: TextStyle(fontSize: 14, color: Colors.grey[600]),
+                textAlign: TextAlign.center,
               ),
-            ),
-            const SizedBox(height: 16),
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: Colors.grey[100],
-                borderRadius: BorderRadius.circular(12),
-              ),
-              child: Column(
-                children: [
-                  const Text("Bin ID",
+              const SizedBox(height: 20),
+              // Item Details Card
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.blue[50],
+                  border: Border.all(color: Colors.blue[700]!, width: 2),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Column(
+                  children: [
+                    const Text(
+                      "📦 E-Waste Item Detected",
                       style:
-                          TextStyle(fontWeight: FontWeight.bold, fontSize: 12)),
-                  const SizedBox(height: 8),
-                  SelectableText(
-                    id,
-                    style: const TextStyle(
-                      fontSize: 16,
-                      fontFamily: 'monospace',
-                      fontWeight: FontWeight.w600,
+                          TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      category,
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.blue[900],
+                      ),
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      subType,
+                      style: TextStyle(fontSize: 12, color: Colors.blue[700]),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      "Weight: ${weight.toStringAsFixed(2)} kg",
+                      style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.bold,
+                          color: Colors.blue[900]),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 12),
+              // Reward Card
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.amber[50],
+                  border: Border.all(color: Colors.amber[700]!, width: 2),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Column(
+                  children: [
+                    const Text(
+                      "🎉 Reward Earned!",
+                      style:
+                          TextStyle(fontWeight: FontWeight.bold, fontSize: 14),
+                    ),
+                    const SizedBox(height: 8),
+                    Text(
+                      "+$reward EBR",
+                      style: TextStyle(
+                        fontSize: 28,
+                        fontWeight: FontWeight.bold,
+                        color: Colors.amber[900],
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 16),
+              Container(
+                padding: const EdgeInsets.all(16),
+                decoration: BoxDecoration(
+                  color: Colors.grey[100],
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Column(
+                  children: [
+                    const Text("Bin ID",
+                        style: TextStyle(
+                            fontWeight: FontWeight.bold, fontSize: 12)),
+                    const SizedBox(height: 8),
+                    SelectableText(
+                      id,
+                      style: const TextStyle(
+                        fontSize: 16,
+                        fontFamily: 'monospace',
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 20),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: () => Navigator.pop(c),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.green,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
                     ),
                   ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 20),
-            SizedBox(
-              width: double.infinity,
-              child: ElevatedButton(
-                onPressed: () => Navigator.pop(c),
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.green,
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-                child: const Padding(
-                  padding: EdgeInsets.symmetric(vertical: 12),
-                  child: Text(
-                    "Scan Another",
-                    style: TextStyle(fontWeight: FontWeight.bold),
+                  child: const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 12),
+                    child: Text(
+                      "Scan Another",
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
                   ),
                 ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     ).then((_) {
+      debugPrint("🔄 [SCAN] Modal closed, triggering balance refresh");
+      widget.onRewardEarned
+          ?.call(); // Trigger balance refresh after user acknowledges
       if (mounted) {
         setState(() {
           _isProcessing = false;

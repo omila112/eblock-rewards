@@ -31,4 +31,30 @@ contract EBRToken is ERC20, Ownable {
         uint256 rewardAmount = weight * 50 * 10 ** decimals();
         _transfer(owner(), user, rewardAmount);
     }
+
+    // ========== WITHDRAWAL FUNCTION ==========
+    /**
+     * @notice Allows users to withdraw tokens from their balance
+     * @dev Uses require() for security checks before transfer
+     * @param _amount The amount of tokens to withdraw (in smallest unit)
+     * 
+     * Requirements:
+     * - Must have sufficient balance
+     * - Amount must be greater than 0
+     * - Contract must have enough tokens to process withdrawal
+     */
+    function withdraw(uint256 _amount) public {
+        require(_amount > 0, "EBRToken: Withdrawal amount must be greater than 0");
+        require(balanceOf(msg.sender) >= _amount, "EBRToken: Insufficient balance");
+        require(balanceOf(address(this)) >= _amount, "EBRToken: Contract has insufficient funds");
+        
+        // Transfer tokens from user to contract (burn/hold)
+        _transfer(msg.sender, address(this), _amount);
+        
+        // Emit event for tracking
+        emit Withdrawal(msg.sender, _amount);
+    }
+
+    // Event for withdrawal tracking
+    event Withdrawal(address indexed user, uint256 amount);
 }
